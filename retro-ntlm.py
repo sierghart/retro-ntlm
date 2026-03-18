@@ -54,11 +54,12 @@ def banner():
 # ─── LDAP: Query GPOs from Active Directory ───────────────────────────────────
 
 def get_gpos_ldap(server, domain, username, password, nthash):
-    """Connects to AD via LDAP and retrieves all GPOs with their display names and paths"""
+    """Connects to AD via LDAP using impacket (same stack as netexec) and retrieves all GPOs"""
     try:
-        from ldap3 import Server, Connection, ALL, NTLM, SUBTREE
+        from impacket.ldap import ldap as impacket_ldap
+        from impacket.ldap import ldapasn1 as ldapasn1_impacket
     except ImportError:
-        print(f"  {RED}[!]{RESET} ldap3 not installed. Run: pip install ldap3 --break-system-packages")
+        print(f"  {RED}[!]{RESET} impacket not installed. Run: pip install impacket --break-system-packages")
         sys.exit(1)
 
     # Build base DN from domain (CORP.LOCAL → DC=CORP,DC=LOCAL)
@@ -67,58 +68,79 @@ def get_gpos_ldap(server, domain, username, password, nthash):
     print(f"  {CYAN}[*]{RESET} Connecting to LDAP: {server}")
     print(f"  {CYAN}[*]{RESET} Base DN: {base_dn}")
 
-    # Build credentials
-    user_str = f"{domain}\\{username}"
-
+    # Parse hash
+    lmhash = ""
+    nthash_val = ""
     if nthash:
-        lm  = "aad3b435b51404eeaad3b435b51404ee"
-        nt  = nthash.split(":")[-1]  # accepts LMHASH:NTHASH or NTHASH only
-        pwd = f"{lm}:{nt}"
-        auth = NTLM
+        parts      = nthash.split(":")
+        lmhash     = parts[0] if len(parts) == 2 else "aad3b435b51404eeaad3b435b51404ee"
+        nthash_val = parts[-1]
         print(f"  {CYAN}[*]{RESET} Auth method: NTLM (pass-the-hash)")
     else:
-        pwd  = password
-        auth = NTLM
         print(f"  {CYAN}[*]{RESET} Auth method: NTLM (password)")
 
     try:
-        srv  = Server(server, get_info=ALL)
-        conn = Connection(
-            srv,
-            user=user_str,
-            password=pwd,
-            authentication=auth,
-            auto_bind=True
+        conn = impacket_ldap.LDAPConnection(
+            f"ldap://{server}",
+            base_dn,
+            server
         )
+        if nthash:
+            conn.login(username, "", domain, lmhash, nthash_val)
+        else:
+            conn.login(username, password, domain)
     except Exception as e:
         print(f"  {RED}[!]{RESET} LDAP connection failed: {e}")
         sys.exit(1)
 
     print(f"  {GREEN}[+]{RESET} LDAP connected successfully\n")
 
-    # Search for all GPOs in the domain
-    gpo_filter = "(objectClass=groupPolicyContainer)"
-    gpo_attrs  = ["displayName", "gPCFileSysPath", "cn", "whenChanged", "flags"]
-
-    conn.search(
-        search_base=f"CN=Policies,CN=System,{base_dn}",
-        search_filter=gpo_filter,
-        search_scope=SUBTREE,
-        attributes=gpo_attrs
-    )
-
+    # Search for all GPOs
     gpos = []
-    for entry in conn.entries:
-        gpo = {
-            "name":    str(entry.displayName)    if entry.displayName    else "Unknown",
-            "path":    str(entry.gPCFileSysPath) if entry.gPCFileSysPath else "",
-            "guid":    str(entry.cn)             if entry.cn             else "",
-            "changed": str(entry.whenChanged)    if entry.whenChanged    else "",
-            "flags":   str(entry.flags)          if entry.flags          else "0",
-        }
-        gpos.append(gpo)
+    try:
+        resp = conn.search(
+            searchBase=f"CN=Policies,CN=System,{base_dn}",
+            searchFilter="(objectClass=groupPolicyContainer)",
+            attributes=["displayName", "gPCFileSysPath", "cn", "whenChanged", "flags"]
+        )
 
-    conn.unbind()
+        for item in resp:
+            if not isinstance(item, ldapasn1_impacket.SearchResultEntry):
+                continue
+
+            name    = ""
+            path    = ""
+            guid    = ""
+            changed = ""
+            flags   = "0"
+
+            for attr in item["attributes"]:
+                attr_name = str(attr["type"])
+                val       = str(attr["vals"][0]) if attr["vals"] else ""
+
+                if attr_name == "displayName":
+                    name = val
+                elif attr_name == "gPCFileSysPath":
+                    path = val
+                elif attr_name == "cn":
+                    guid = val
+                elif attr_name == "whenChanged":
+                    changed = val
+                elif attr_name == "flags":
+                    flags = val
+
+            gpos.append({
+                "name":    name or "Unknown",
+                "path":    path,
+                "guid":    guid,
+                "changed": changed,
+                "flags":   flags,
+            })
+
+    except Exception as e:
+        print(f"  {RED}[!]{RESET} LDAP search failed: {e}")
+        sys.exit(1)
+
     print(f"  {CYAN}[*]{RESET} Found {BOLD}{len(gpos)}{RESET} GPOs in the domain\n")
     return gpos
 
@@ -268,45 +290,46 @@ def parse_lm_level(content):
 
 def check_ldap_security_policy(server, domain, username, password, nthash):
     """
-    Fallback: searches for LmCompatibilityLevel hints in AD password/lockout policy.
+    Fallback: searches for domain info via impacket LDAP.
     Not as accurate as SYSVOL but works without SMB access.
     """
     try:
-        from ldap3 import Server, Connection, ALL, NTLM, SUBTREE
+        from impacket.ldap import ldap as impacket_ldap
+        from impacket.ldap import ldapasn1 as ldapasn1_impacket
     except ImportError:
         return []
 
-    base_dn  = ",".join([f"DC={part}" for part in domain.split(".")])
-    user_str = f"{domain}\\{username}"
+    base_dn = ",".join([f"DC={part}" for part in domain.split(".")])
 
+    lmhash    = ""
+    nthash_val = ""
     if nthash:
-        lm  = "aad3b435b51404eeaad3b435b51404ee"
-        nt  = nthash.split(":")[-1]
-        pwd = f"{lm}:{nt}"
-    else:
-        pwd = password
+        parts      = nthash.split(":")
+        lmhash     = parts[0] if len(parts) == 2 else "aad3b435b51404eeaad3b435b51404ee"
+        nthash_val = parts[-1]
 
     results = []
     try:
-        srv  = Server(server, get_info=ALL)
-        conn = Connection(srv, user=user_str, password=pwd, authentication=NTLM, auto_bind=True)
+        conn = impacket_ldap.LDAPConnection(f"ldap://{server}", base_dn, server)
+        if nthash:
+            conn.login(username, "", domain, lmhash, nthash_val)
+        else:
+            conn.login(username, password, domain)
 
-        # Search for msDS-Behavior-Version and domain functional level
-        conn.search(
-            search_base=base_dn,
-            search_filter="(objectClass=domain)",
-            search_scope=SUBTREE,
+        resp = conn.search(
+            searchBase=base_dn,
+            searchFilter="(objectClass=domain)",
             attributes=["msDS-Behavior-Version", "ms-DS-MachineAccountQuota",
                         "minPwdLength", "lockoutThreshold", "pwdProperties"]
         )
 
-        for entry in conn.entries:
-            results.append({
-                "type":    "Domain Info",
-                "details": str(entry)
-            })
+        for item in resp:
+            if isinstance(item, ldapasn1_impacket.SearchResultEntry):
+                results.append({
+                    "type":    "Domain Info",
+                    "details": str(item)
+                })
 
-        conn.unbind()
     except Exception:
         pass
 
